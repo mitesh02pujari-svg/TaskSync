@@ -1,6 +1,6 @@
 import Auth from './components/Auth';
 import { useAuth } from './context/AuthContext';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { supabase } from './lib/supabase';
 import './App.css';
 
@@ -62,6 +62,12 @@ function Icon({ name, size = 16 }) {
       <>
         <circle cx="12" cy="12" r="9" />
         <path d="M12 7v5l3 2M8.5 3.8 7 2.5M15.5 3.8 17 2.5" />
+      </>
+    ),
+    search: (
+      <>
+        <circle cx="10.8" cy="10.8" r="6.8" />
+        <path d="m16 16 4 4" />
       </>
     ),
     priorityHigh: (
@@ -131,28 +137,44 @@ function App() {
   }
 
   if (!user) {
-    return <Auth />;
+    return (
+      <div className="auth-shell">
+        <Auth />
+      </div>
+    );
   }
 
-  return <TaskManager key={user.id} userId={user.id} />;
+  return (
+    <TaskManager
+      key={user.id}
+      userId={user.id}
+      userEmail={user.email}
+    />
+  );
 }
 
-function TaskManager({ userId }) {
+function TaskManager({ userId, userEmail }) {
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState('');
   const [taskError, setTaskError] = useState('');
   const [tasksLoading, setTasksLoading] = useState(true);
-  const [taskActionPending, setTaskActionPending] = useState(false);
+  const [pendingAction, setPendingAction] = useState(null);
+  const [completedCount, setCompletedCount] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [priorityFilter, setPriorityFilter] = useState('All');
+  const [clearDialogOpen, setClearDialogOpen] = useState(false);
   const [title, setTitle] = useState('');
   const [priority, setPriority] = useState('Medium');
   const [tasks, setTasks] = useState([]);
   const [taskHistory, setTaskHistory] = useState([]);
+  const clearButtonRef = useRef(null);
+  const cancelClearRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadTasks() {
-      const [unfinishedResult, historyResult] = await Promise.all([
+      const [unfinishedResult, historyResult, completedCountResult] = await Promise.all([
         supabase
           .from('tasks')
           .select(taskColumns)
@@ -166,15 +188,25 @@ function TaskManager({ userId }) {
           .eq('completed', true)
           .order('completed_at', { ascending: false, nullsFirst: false })
           .limit(10),
+        supabase
+          .from('tasks')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', userId)
+          .eq('completed', true),
       ]);
 
-      if (unfinishedResult.error || historyResult.error) {
+      if (
+        unfinishedResult.error ||
+        historyResult.error ||
+        completedCountResult.error
+      ) {
         throw new Error('Could not load tasks.');
       }
 
       if (!cancelled) {
         setTasks((unfinishedResult.data ?? []).map(mapTask));
         setTaskHistory((historyResult.data ?? []).map(mapTask));
+        setCompletedCount(completedCountResult.count ?? 0);
         setTasksLoading(false);
       }
     }
@@ -191,10 +223,30 @@ function TaskManager({ userId }) {
     };
   }, [userId]);
 
+  useEffect(() => {
+    if (!clearDialogOpen) {
+      return undefined;
+    }
+
+    const clearButton = clearButtonRef.current;
+    cancelClearRef.current?.focus();
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setClearDialogOpen(false);
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      clearButton?.focus();
+    };
+  }, [clearDialogOpen]);
+
   async function handleSubmit(event) {
     event.preventDefault();
 
-    if (taskActionPending || tasksLoading) {
+    if (pendingAction || tasksLoading) {
       return;
     }
 
@@ -203,7 +255,7 @@ function TaskManager({ userId }) {
       return;
     }
 
-    setTaskActionPending(true);
+    setPendingAction('create');
     setTaskError('');
 
     try {
@@ -227,16 +279,16 @@ function TaskManager({ userId }) {
     } catch {
       setTaskError('Could not create task. Please try again.');
     } finally {
-      setTaskActionPending(false);
+      setPendingAction(null);
     }
   }
 
   async function handleComplete(taskToComplete) {
-    if (taskActionPending) {
+    if (pendingAction) {
       return;
     }
 
-    setTaskActionPending(true);
+    setPendingAction(`complete:${taskToComplete.id}`);
     setTaskError('');
 
     try {
@@ -263,19 +315,20 @@ function TaskManager({ userId }) {
       setTaskHistory((currentHistory) =>
         [completedTask, ...currentHistory].slice(0, 10),
       );
+      setCompletedCount((count) => count + 1);
     } catch {
       setTaskError('Could not complete task. Please try again.');
     } finally {
-      setTaskActionPending(false);
+      setPendingAction(null);
     }
   }
 
   async function handleDelete(taskId) {
-    if (taskActionPending) {
+    if (pendingAction) {
       return;
     }
 
-    setTaskActionPending(true);
+    setPendingAction(`delete:${taskId}`);
     setTaskError('');
 
     try {
@@ -298,40 +351,34 @@ function TaskManager({ userId }) {
     } catch {
       setTaskError('Could not delete task. Please try again.');
     } finally {
-      setTaskActionPending(false);
+      setPendingAction(null);
     }
   }
 
-  async function handleClearAllTasks() {
-    if (taskActionPending) {
+  async function clearPendingTasks() {
+    if (pendingAction) {
       return;
     }
 
-    const confirmed = window.confirm(
-      'Are you sure you want to clear all unfinished tasks?',
-    );
+    setPendingAction('clear');
+    setTaskError('');
 
-    if (confirmed) {
-      setTaskActionPending(true);
-      setTaskError('');
+    try {
+      const { error } = await supabase
+        .from('tasks')
+        .delete()
+        .eq('user_id', userId)
+        .eq('completed', false);
 
-      try {
-        const { error } = await supabase
-          .from('tasks')
-          .delete()
-          .eq('user_id', userId)
-          .eq('completed', false);
-
-        if (error) {
-          throw new Error('Could not clear tasks.');
-        }
-
-        setTasks([]);
-      } catch {
-        setTaskError('Could not clear tasks. Please try again.');
-      } finally {
-        setTaskActionPending(false);
+      if (error) {
+        throw new Error('Could not clear tasks.');
       }
+      setTasks([]);
+      setClearDialogOpen(false);
+    } catch {
+      setTaskError('Could not clear tasks. Please try again.');
+    } finally {
+      setPendingAction(null);
     }
   }
 
@@ -339,6 +386,13 @@ function TaskManager({ userId }) {
     (firstTask, secondTask) =>
       priorityOrder[firstTask.priority] - priorityOrder[secondTask.priority],
   );
+  const normalizedSearch = searchQuery.trim().toLocaleLowerCase();
+  const visibleTasks = sortedTasks.filter((task) => (
+    (priorityFilter === 'All' || task.priority === priorityFilter) &&
+    task.title.toLocaleLowerCase().includes(normalizedSearch)
+  ));
+  const pendingCount = tasks.length;
+  const totalCount = pendingCount + completedCount;
 
   async function handleLogout() {
     setLoggingOut(true);
@@ -363,11 +417,12 @@ function TaskManager({ userId }) {
           <Icon name="brand" size={27} />
         </div>
         <div className="header-copy">
-          <p className="eyebrow">PERSONAL TASK MANAGER</p>
+          <p className="eyebrow">YOUR PERSONAL WORKSPACE</p>
           <h1>TaskSync</h1>
-          <p className="subtitle">
-            Organize your tasks and stay productive.
-          </p>
+          <p className="subtitle">Stay organized. Get things done.</p>
+        </div>
+        <div className="header-account">
+          <span className="user-email" title={userEmail}>{userEmail}</span>
           <button
             className="button button-logout"
             type="button"
@@ -376,28 +431,48 @@ function TaskManager({ userId }) {
           >
             {loggingOut ? 'Logging out...' : 'Logout'}
           </button>
-          {logoutError && <p role="alert">{logoutError}</p>}
         </div>
       </header>
-      {taskError && <p role="alert">{taskError}</p>}
+      {logoutError && <p className="feedback-error" role="alert">{logoutError}</p>}
+      {taskError && !clearDialogOpen && (
+        <p className="feedback-error" role="alert">{taskError}</p>
+      )}
       {tasksLoading ? (
-        <p>Loading tasks...</p>
+        <div className="loading-dashboard" role="status" aria-label="Loading dashboard">
+          <span className="loading-message">Loading your workspace...</span>
+          <div className="loading-stat-grid">
+            {[1, 2, 3].map((item) => <div className="skeleton skeleton-stat" key={item} />)}
+          </div>
+          <div className="skeleton skeleton-create" />
+          <div className="skeleton skeleton-dashboard" />
+        </div>
       ) : (
-        <main className="dashboard-grid">
-          <section
-            className="panel tasks-panel"
-            aria-labelledby="unfinished-tasks-heading"
-          >
+        <main className="workspace">
+          <section className="stats-grid" aria-label="Task statistics">
+            <article className="stat-card">
+              <span className="stat-label">Total tasks</span>
+              <strong>{totalCount}</strong>
+              <span className="stat-detail">In your workspace</span>
+            </article>
+            <article className="stat-card stat-completed">
+              <span className="stat-label">Completed</span>
+              <strong>{completedCount}</strong>
+              <span className="stat-detail">All-time completed</span>
+            </article>
+            <article className="stat-card stat-pending">
+              <span className="stat-label">Pending</span>
+              <strong>{pendingCount}</strong>
+              <span className="stat-detail">Ready when you are</span>
+            </article>
+          </section>
+
+          <section className="panel create-panel" aria-labelledby="create-task-heading">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">YOUR WORKSPACE</p>
-                <h2 id="unfinished-tasks-heading">Unfinished Tasks</h2>
+                <p className="eyebrow">MAKE PROGRESS</p>
+                <h2 id="create-task-heading">Create New Task</h2>
               </div>
-              <span className="task-count" aria-label={`${tasks.length} unfinished tasks`}>
-                {tasks.length}
-              </span>
             </div>
-
             <form className="task-form" onSubmit={handleSubmit}>
               <div className="form-field title-field">
                 <label htmlFor="task-title">Task title</label>
@@ -409,7 +484,7 @@ function TaskManager({ userId }) {
                   value={title}
                   onChange={(event) => setTitle(event.target.value)}
                   required
-                  disabled={taskActionPending}
+                  disabled={Boolean(pendingAction)}
                 />
               </div>
 
@@ -420,7 +495,7 @@ function TaskManager({ userId }) {
                   name="priority"
                   value={priority}
                   onChange={(event) => setPriority(event.target.value)}
-                  disabled={taskActionPending}
+                  disabled={Boolean(pendingAction)}
                 >
                   <option value="High">High</option>
                   <option value="Medium">Medium</option>
@@ -431,24 +506,74 @@ function TaskManager({ userId }) {
               <button
                 className="button button-primary add-button"
                 type="submit"
-                disabled={taskActionPending}
+                disabled={Boolean(pendingAction)}
               >
                 <Icon name="add" />
-                Add Task
+                {pendingAction === 'create' ? 'Adding task...' : 'Add Task'}
               </button>
             </form>
+          </section>
+
+          <div className="dashboard-grid">
+            <section
+              className="panel tasks-panel"
+              aria-labelledby="unfinished-tasks-heading"
+            >
+              <div className="section-heading">
+                <div>
+                  <p className="eyebrow">YOUR WORKSPACE</p>
+                  <h2 id="unfinished-tasks-heading">Pending Tasks</h2>
+                </div>
+                <span className="task-count" aria-label={`${tasks.length} pending tasks`}>
+                  {tasks.length}
+                </span>
+              </div>
+
+              <div className="task-tools">
+                <label className="search-field">
+                  <span className="sr-only">Search pending tasks</span>
+                  <Icon name="search" size={17} />
+                  <input
+                    type="search"
+                    placeholder="Search tasks..."
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                  />
+                </label>
+                <div className="priority-filters" aria-label="Filter by priority">
+                  {['All', 'High', 'Medium', 'Low'].map((filter) => (
+                    <button
+                      className={`filter-button${priorityFilter === filter ? ' active' : ''}`}
+                      type="button"
+                      key={filter}
+                      aria-pressed={priorityFilter === filter}
+                      onClick={() => setPriorityFilter(filter)}
+                    >
+                      {filter}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
             {tasks.length === 0 ? (
-              <div className="empty-state">
-                <span className="empty-state-icon" aria-hidden="true">
-                  <Icon name="unfinished" size={20} />
-                </span>
-                <h3>You’re all caught up</h3>
-                <p>Add a task above and it’ll show up here.</p>
-              </div>
+                <div className="empty-state">
+                  <span className="empty-state-icon" aria-hidden="true">
+                    <Icon name="unfinished" size={20} />
+                  </span>
+                  <h3>No pending tasks</h3>
+                  <p>You’re all caught up! Create a task to get started.</p>
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    onClick={() => document.getElementById('task-title')?.focus()}
+                  >
+                    Create a task
+                  </button>
+                </div>
             ) : (
-              <ul className="task-list">
-                {sortedTasks.map((task) => (
+                visibleTasks.length ? (
+                  <ul className="task-list">
+                    {visibleTasks.map((task) => (
                   <li key={task.id}>
                     <article className="task-card">
                       <div className="task-card-main">
@@ -466,67 +591,78 @@ function TaskManager({ userId }) {
                           className="button button-complete"
                           type="button"
                           onClick={() => handleComplete(task)}
-                          disabled={taskActionPending}
+                          disabled={Boolean(pendingAction)}
                         >
                           <Icon name="complete" />
-                          Complete
+                          {pendingAction === `complete:${task.id}` ? 'Completing...' : 'Complete'}
                         </button>
                         <button
                           className="button button-delete"
                           type="button"
                           onClick={() => handleDelete(task.id)}
-                          disabled={taskActionPending}
+                          disabled={Boolean(pendingAction)}
                         >
                           <Icon name="delete" />
-                          Delete
+                          {pendingAction === `delete:${task.id}` ? 'Deleting...' : 'Delete'}
                         </button>
                       </div>
                     </article>
                   </li>
-                ))}
-              </ul>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="empty-state filtered-empty-state">
+                    <h3>No matching tasks</h3>
+                    <p>Try another search or priority filter.</p>
+                  </div>
+                )
             )}
 
             {tasks.length > 0 && (
               <button
+                ref={clearButtonRef}
                 className="button button-clear"
                 type="button"
-                onClick={handleClearAllTasks}
-                disabled={taskActionPending}
+                onClick={() => setClearDialogOpen(true)}
+                disabled={Boolean(pendingAction)}
               >
                 <Icon name="clear" />
                 Clear All Tasks
               </button>
             )}
-          </section>
+            </section>
 
-          <section
-            className="panel history-panel"
-            aria-labelledby="task-history-heading"
-          >
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">RECENTLY FINISHED</p>
-                <h2 id="task-history-heading" className="history-heading">
-                  <Icon name="history" size={19} />
-                  Task History
-                </h2>
+            <section
+              className="panel history-panel"
+              aria-labelledby="task-history-heading"
+            >
+              <div className="section-heading">
+                <div>
+                  <p className="eyebrow">RECENTLY FINISHED</p>
+                  <h2 id="task-history-heading" className="history-heading">
+                    <Icon name="history" size={19} />
+                    Task History
+                  </h2>
+                </div>
+                <span className="history-limit">Latest 10</span>
               </div>
-            </div>
-            {taskHistory.length === 0 ? (
-              <div className="empty-state history-empty-state">
-                <span className="empty-state-icon history-icon" aria-hidden="true">
-                  <Icon name="historyEmpty" size={20} />
-                </span>
-                <h3>Your progress starts here</h3>
-                <p>Tasks you complete will appear in this list.</p>
-              </div>
-            ) : (
-              <ul className="task-list history-list">
-                {taskHistory.map((task) => (
+              {taskHistory.length === 0 ? (
+                <div className="empty-state history-empty-state">
+                  <span className="empty-state-icon history-icon" aria-hidden="true">
+                    <Icon name="historyEmpty" size={20} />
+                  </span>
+                  <h3>No completed tasks yet</h3>
+                  <p>Completed tasks will appear here.</p>
+                </div>
+              ) : (
+                <ul className="task-list history-list">
+                  {taskHistory.map((task) => (
                   <li key={task.id}>
                     <article className="task-card history-card">
                       <div className="task-card-main">
+                        <span className="completion-mark" aria-label="Completed">
+                          <Icon name="complete" size={14} />
+                        </span>
                         <h3>{task.title}</h3>
                         <PriorityBadge priority={task.priority} />
                       </div>
@@ -538,11 +674,68 @@ function TaskManager({ userId }) {
                       </p>
                     </article>
                   </li>
-                ))}
-              </ul>
-            )}
-          </section>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </div>
         </main>
+      )}
+      {clearDialogOpen && (
+        <div className="modal-backdrop">
+          <section
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="clear-dialog-title"
+            aria-describedby="clear-dialog-description"
+            onKeyDown={(event) => {
+              if (event.key !== 'Tab') return;
+              const focusable = event.currentTarget.querySelectorAll('button:not(:disabled)');
+              if (!focusable.length) {
+                event.preventDefault();
+                return;
+              }
+              const first = focusable[0];
+              const last = focusable[focusable.length - 1];
+              if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+              }
+            }}
+          >
+            <div className="dialog-icon"><Icon name="clear" size={20} /></div>
+            <h2 id="clear-dialog-title">Clear all pending tasks?</h2>
+            <p id="clear-dialog-description">
+              This action will permanently remove all pending tasks. Completed
+              history will not be affected.
+            </p>
+            {taskError && <p className="feedback-error dialog-error" role="alert">{taskError}</p>}
+            {pendingAction === 'clear' && <p className="dialog-progress">Clearing pending tasks...</p>}
+            <div className="dialog-actions">
+              <button
+                className="button button-secondary"
+                type="button"
+                ref={cancelClearRef}
+                onClick={() => setClearDialogOpen(false)}
+                disabled={pendingAction === 'clear'}
+              >
+                Cancel
+              </button>
+              <button
+                className="button button-danger"
+                type="button"
+                onClick={clearPendingTasks}
+                disabled={Boolean(pendingAction)}
+              >
+                {pendingAction === 'clear' ? 'Clearing...' : 'Clear Tasks'}
+              </button>
+            </div>
+          </section>
+        </div>
       )}
     </div>
   );

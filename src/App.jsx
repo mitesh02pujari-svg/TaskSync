@@ -1,14 +1,17 @@
+import Auth from './components/Auth';
+import { useAuth } from './context/AuthContext';
 import { useEffect, useState } from 'react';
+import { supabase } from './lib/supabase';
 import './App.css';
+
+const taskColumns =
+  'id, title, priority, completed, created_at, completed_at';
 
 const priorityOrder = {
   High: 1,
   Medium: 2,
   Low: 3,
 };
-
-const unfinishedTasksStorageKey = 'tasksync_unfinished_tasks';
-const taskHistoryStorageKey = 'tasksync_completed_task_history';
 
 function Icon({ name, size = 16 }) {
   const iconShapes = {
@@ -109,116 +112,226 @@ function PriorityBadge({ priority }) {
   );
 }
 
-function isValidTask(task, isCompleted) {
-  return (
-    task !== null &&
-    typeof task === 'object' &&
-    typeof task.id === 'string' &&
-    typeof task.title === 'string' &&
-    Object.hasOwn(priorityOrder, task.priority) &&
-    task.completed === isCompleted &&
-    typeof task.createdAt === 'string' &&
-    Number.isFinite(Date.parse(task.createdAt)) &&
-    (!isCompleted ||
-      (typeof task.completedAt === 'string' &&
-        Number.isFinite(Date.parse(task.completedAt))))
-  );
-}
-
-function loadTasks(storageKey, isCompleted) {
-  try {
-    const savedTasks = window.localStorage.getItem(storageKey);
-    if (savedTasks === null) {
-      return [];
-    }
-
-    const parsedTasks = JSON.parse(savedTasks);
-    if (!Array.isArray(parsedTasks)) {
-      console.error(`Saved data for "${storageKey}" is not a task list.`);
-      return [];
-    }
-
-    return parsedTasks.filter((task) => isValidTask(task, isCompleted));
-  } catch (error) {
-    console.error(`Could not load tasks from "${storageKey}".`, error);
-    return [];
-  }
-}
-
-function saveTasks(storageKey, tasks) {
-  try {
-    window.localStorage.setItem(storageKey, JSON.stringify(tasks));
-  } catch (error) {
-    console.error(`Could not save tasks to "${storageKey}".`, error);
-  }
+function mapTask(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    priority: row.priority,
+    completed: row.completed,
+    createdAt: row.created_at,
+    ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+  };
 }
 
 function App() {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return <div>Loading...</div>;
+  }
+
+  if (!user) {
+    return <Auth />;
+  }
+
+  return <TaskManager key={user.id} userId={user.id} />;
+}
+
+function TaskManager({ userId }) {
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState('');
+  const [taskError, setTaskError] = useState('');
+  const [tasksLoading, setTasksLoading] = useState(true);
+  const [taskActionPending, setTaskActionPending] = useState(false);
   const [title, setTitle] = useState('');
   const [priority, setPriority] = useState('Medium');
-  const [tasks, setTasks] = useState(() =>
-    loadTasks(unfinishedTasksStorageKey, false),
-  );
-  const [taskHistory, setTaskHistory] = useState(() =>
-    loadTasks(taskHistoryStorageKey, true).slice(0, 10),
-  );
+  const [tasks, setTasks] = useState([]);
+  const [taskHistory, setTaskHistory] = useState([]);
 
   useEffect(() => {
-    saveTasks(unfinishedTasksStorageKey, tasks);
-  }, [tasks]);
+    let cancelled = false;
 
-  useEffect(() => {
-    saveTasks(taskHistoryStorageKey, taskHistory);
-  }, [taskHistory]);
+    async function loadTasks() {
+      const [unfinishedResult, historyResult] = await Promise.all([
+        supabase
+          .from('tasks')
+          .select(taskColumns)
+          .eq('user_id', userId)
+          .eq('completed', false)
+          .order('created_at', { ascending: true }),
+        supabase
+          .from('tasks')
+          .select(taskColumns)
+          .eq('user_id', userId)
+          .eq('completed', true)
+          .order('completed_at', { ascending: false, nullsFirst: false })
+          .limit(10),
+      ]);
 
-  function handleSubmit(event) {
+      if (unfinishedResult.error || historyResult.error) {
+        throw new Error('Could not load tasks.');
+      }
+
+      if (!cancelled) {
+        setTasks((unfinishedResult.data ?? []).map(mapTask));
+        setTaskHistory((historyResult.data ?? []).map(mapTask));
+        setTasksLoading(false);
+      }
+    }
+
+    loadTasks().catch(() => {
+      if (!cancelled) {
+        setTaskError('Could not load your tasks. Please try again.');
+        setTasksLoading(false);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  async function handleSubmit(event) {
     event.preventDefault();
+
+    if (taskActionPending || tasksLoading) {
+      return;
+    }
 
     const trimmedTitle = title.trim();
     if (!trimmedTitle) {
       return;
     }
 
-    const newTask = {
-      id: crypto.randomUUID(),
-      title: trimmedTitle,
-      priority,
-      completed: false,
-      createdAt: new Date().toISOString(),
-    };
+    setTaskActionPending(true);
+    setTaskError('');
 
-    setTasks((currentTasks) => [...currentTasks, newTask]);
-    setTitle('');
+    try {
+      const { data, error } = await supabase
+        .from('tasks')
+        .insert({
+          user_id: userId,
+          title: trimmedTitle,
+          priority,
+          completed: false,
+        })
+        .select(taskColumns)
+        .single();
+
+      if (error || !data) {
+        throw new Error('Could not create task.');
+      }
+
+      setTasks((currentTasks) => [...currentTasks, mapTask(data)]);
+      setTitle('');
+    } catch {
+      setTaskError('Could not create task. Please try again.');
+    } finally {
+      setTaskActionPending(false);
+    }
   }
 
-  function handleComplete(taskToComplete) {
-    const completedTask = {
-      ...taskToComplete,
-      completed: true,
-      completedAt: new Date().toISOString(),
-    };
+  async function handleComplete(taskToComplete) {
+    if (taskActionPending) {
+      return;
+    }
 
-    setTasks((currentTasks) =>
-      currentTasks.filter((task) => task.id !== taskToComplete.id),
-    );
-    setTaskHistory((currentHistory) =>
-      [completedTask, ...currentHistory].slice(0, 10),
-    );
+    setTaskActionPending(true);
+    setTaskError('');
+
+    try {
+      const { data, error } = await supabase
+        .from('tasks')
+        .update({
+          completed: true,
+          completed_at: new Date().toISOString(),
+        })
+        .eq('id', taskToComplete.id)
+        .eq('user_id', userId)
+        .eq('completed', false)
+        .select(taskColumns)
+        .single();
+
+      if (error || !data) {
+        throw new Error('Could not complete task.');
+      }
+
+      const completedTask = mapTask(data);
+      setTasks((currentTasks) =>
+        currentTasks.filter((task) => task.id !== taskToComplete.id),
+      );
+      setTaskHistory((currentHistory) =>
+        [completedTask, ...currentHistory].slice(0, 10),
+      );
+    } catch {
+      setTaskError('Could not complete task. Please try again.');
+    } finally {
+      setTaskActionPending(false);
+    }
   }
 
-  function handleDelete(taskId) {
-    setTasks((currentTasks) =>
-      currentTasks.filter((task) => task.id !== taskId),
-    );
+  async function handleDelete(taskId) {
+    if (taskActionPending) {
+      return;
+    }
+
+    setTaskActionPending(true);
+    setTaskError('');
+
+    try {
+      const { error } = await supabase
+        .from('tasks')
+        .delete()
+        .eq('id', taskId)
+        .eq('user_id', userId)
+        .eq('completed', false)
+        .select('id')
+        .single();
+
+      if (error) {
+        throw new Error('Could not delete task.');
+      }
+
+      setTasks((currentTasks) =>
+        currentTasks.filter((task) => task.id !== taskId),
+      );
+    } catch {
+      setTaskError('Could not delete task. Please try again.');
+    } finally {
+      setTaskActionPending(false);
+    }
   }
 
-  function handleClearAllTasks() {
+  async function handleClearAllTasks() {
+    if (taskActionPending) {
+      return;
+    }
+
     const confirmed = window.confirm(
       'Are you sure you want to clear all unfinished tasks?',
     );
 
     if (confirmed) {
-      setTasks([]);
+      setTaskActionPending(true);
+      setTaskError('');
+
+      try {
+        const { error } = await supabase
+          .from('tasks')
+          .delete()
+          .eq('user_id', userId)
+          .eq('completed', false);
+
+        if (error) {
+          throw new Error('Could not clear tasks.');
+        }
+
+        setTasks([]);
+      } catch {
+        setTaskError('Could not clear tasks. Please try again.');
+      } finally {
+        setTaskActionPending(false);
+      }
     }
   }
 
@@ -226,6 +339,22 @@ function App() {
     (firstTask, secondTask) =>
       priorityOrder[firstTask.priority] - priorityOrder[secondTask.priority],
   );
+
+  async function handleLogout() {
+    setLoggingOut(true);
+    setLogoutError('');
+
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) {
+        throw error;
+      }
+    } catch (error) {
+      setLogoutError(error.message || 'Could not log out.');
+    } finally {
+      setLoggingOut(false);
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -239,160 +368,182 @@ function App() {
           <p className="subtitle">
             Organize your tasks and stay productive.
           </p>
+          <button
+            className="button button-logout"
+            type="button"
+            onClick={handleLogout}
+            disabled={loggingOut}
+          >
+            {loggingOut ? 'Logging out...' : 'Logout'}
+          </button>
+          {logoutError && <p role="alert">{logoutError}</p>}
         </div>
       </header>
-
-      <main className="dashboard-grid">
-        <section
-          className="panel tasks-panel"
-          aria-labelledby="unfinished-tasks-heading"
-        >
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">YOUR WORKSPACE</p>
-              <h2 id="unfinished-tasks-heading">Unfinished Tasks</h2>
-            </div>
-            <span className="task-count" aria-label={`${tasks.length} unfinished tasks`}>
-              {tasks.length}
-            </span>
-          </div>
-
-          <form className="task-form" onSubmit={handleSubmit}>
-            <div className="form-field title-field">
-              <label htmlFor="task-title">Task title</label>
-              <input
-                id="task-title"
-                name="title"
-                type="text"
-                placeholder="What needs to get done?"
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                required
-              />
+      {taskError && <p role="alert">{taskError}</p>}
+      {tasksLoading ? (
+        <p>Loading tasks...</p>
+      ) : (
+        <main className="dashboard-grid">
+          <section
+            className="panel tasks-panel"
+            aria-labelledby="unfinished-tasks-heading"
+          >
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">YOUR WORKSPACE</p>
+                <h2 id="unfinished-tasks-heading">Unfinished Tasks</h2>
+              </div>
+              <span className="task-count" aria-label={`${tasks.length} unfinished tasks`}>
+                {tasks.length}
+              </span>
             </div>
 
-            <div className="form-field priority-field">
-              <label htmlFor="task-priority">Priority</label>
-              <select
-                id="task-priority"
-                name="priority"
-                value={priority}
-                onChange={(event) => setPriority(event.target.value)}
+            <form className="task-form" onSubmit={handleSubmit}>
+              <div className="form-field title-field">
+                <label htmlFor="task-title">Task title</label>
+                <input
+                  id="task-title"
+                  name="title"
+                  type="text"
+                  placeholder="What needs to get done?"
+                  value={title}
+                  onChange={(event) => setTitle(event.target.value)}
+                  required
+                  disabled={taskActionPending}
+                />
+              </div>
+
+              <div className="form-field priority-field">
+                <label htmlFor="task-priority">Priority</label>
+                <select
+                  id="task-priority"
+                  name="priority"
+                  value={priority}
+                  onChange={(event) => setPriority(event.target.value)}
+                  disabled={taskActionPending}
+                >
+                  <option value="High">High</option>
+                  <option value="Medium">Medium</option>
+                  <option value="Low">Low</option>
+                </select>
+              </div>
+
+              <button
+                className="button button-primary add-button"
+                type="submit"
+                disabled={taskActionPending}
               >
-                <option value="High">High</option>
-                <option value="Medium">Medium</option>
-                <option value="Low">Low</option>
-              </select>
-            </div>
+                <Icon name="add" />
+                Add Task
+              </button>
+            </form>
 
-            <button className="button button-primary add-button" type="submit">
-              <Icon name="add" />
-              Add Task
-            </button>
-          </form>
+            {tasks.length === 0 ? (
+              <div className="empty-state">
+                <span className="empty-state-icon" aria-hidden="true">
+                  <Icon name="unfinished" size={20} />
+                </span>
+                <h3>You’re all caught up</h3>
+                <p>Add a task above and it’ll show up here.</p>
+              </div>
+            ) : (
+              <ul className="task-list">
+                {sortedTasks.map((task) => (
+                  <li key={task.id}>
+                    <article className="task-card">
+                      <div className="task-card-main">
+                        <h3>{task.title}</h3>
+                        <PriorityBadge priority={task.priority} />
+                      </div>
+                      <p className="task-time">
+                        Created:{' '}
+                        <time dateTime={task.createdAt}>
+                          {new Date(task.createdAt).toLocaleString()}
+                        </time>
+                      </p>
+                      <div className="task-actions">
+                        <button
+                          className="button button-complete"
+                          type="button"
+                          onClick={() => handleComplete(task)}
+                          disabled={taskActionPending}
+                        >
+                          <Icon name="complete" />
+                          Complete
+                        </button>
+                        <button
+                          className="button button-delete"
+                          type="button"
+                          onClick={() => handleDelete(task.id)}
+                          disabled={taskActionPending}
+                        >
+                          <Icon name="delete" />
+                          Delete
+                        </button>
+                      </div>
+                    </article>
+                  </li>
+                ))}
+              </ul>
+            )}
 
-          {tasks.length === 0 ? (
-            <div className="empty-state">
-              <span className="empty-state-icon" aria-hidden="true">
-                <Icon name="unfinished" size={20} />
-              </span>
-              <h3>You’re all caught up</h3>
-              <p>Add a task above and it’ll show up here.</p>
-            </div>
-          ) : (
-            <ul className="task-list">
-              {sortedTasks.map((task) => (
-                <li key={task.id}>
-                  <article className="task-card">
-                    <div className="task-card-main">
-                      <h3>{task.title}</h3>
-                      <PriorityBadge priority={task.priority} />
-                    </div>
-                    <p className="task-time">
-                      Created:{' '}
-                      <time dateTime={task.createdAt}>
-                        {new Date(task.createdAt).toLocaleString()}
-                      </time>
-                    </p>
-                    <div className="task-actions">
-                      <button
-                        className="button button-complete"
-                        type="button"
-                        onClick={() => handleComplete(task)}
-                      >
-                        <Icon name="complete" />
-                        Complete
-                      </button>
-                      <button
-                        className="button button-delete"
-                        type="button"
-                        onClick={() => handleDelete(task.id)}
-                      >
-                        <Icon name="delete" />
-                        Delete
-                      </button>
-                    </div>
-                  </article>
-                </li>
-              ))}
-            </ul>
-          )}
+            {tasks.length > 0 && (
+              <button
+                className="button button-clear"
+                type="button"
+                onClick={handleClearAllTasks}
+                disabled={taskActionPending}
+              >
+                <Icon name="clear" />
+                Clear All Tasks
+              </button>
+            )}
+          </section>
 
-          {tasks.length > 0 && (
-            <button
-              className="button button-clear"
-              type="button"
-              onClick={handleClearAllTasks}
-            >
-              <Icon name="clear" />
-              Clear All Tasks
-            </button>
-          )}
-        </section>
-
-        <section
-          className="panel history-panel"
-          aria-labelledby="task-history-heading"
-        >
-          <div className="section-heading">
-            <div>
-              <p className="eyebrow">RECENTLY FINISHED</p>
-              <h2 id="task-history-heading" className="history-heading">
-                <Icon name="history" size={19} />
-                Task History
-              </h2>
+          <section
+            className="panel history-panel"
+            aria-labelledby="task-history-heading"
+          >
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">RECENTLY FINISHED</p>
+                <h2 id="task-history-heading" className="history-heading">
+                  <Icon name="history" size={19} />
+                  Task History
+                </h2>
+              </div>
             </div>
-          </div>
-          {taskHistory.length === 0 ? (
-            <div className="empty-state history-empty-state">
-              <span className="empty-state-icon history-icon" aria-hidden="true">
-                <Icon name="historyEmpty" size={20} />
-              </span>
-              <h3>Your progress starts here</h3>
-              <p>Tasks you complete will appear in this list.</p>
-            </div>
-          ) : (
-            <ul className="task-list history-list">
-              {taskHistory.map((task) => (
-                <li key={task.id}>
-                  <article className="task-card history-card">
-                    <div className="task-card-main">
-                      <h3>{task.title}</h3>
-                      <PriorityBadge priority={task.priority} />
-                    </div>
-                    <p className="task-time">
-                      Completed:{' '}
-                      <time dateTime={task.completedAt}>
-                        {new Date(task.completedAt).toLocaleString()}
-                      </time>
-                    </p>
-                  </article>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      </main>
+            {taskHistory.length === 0 ? (
+              <div className="empty-state history-empty-state">
+                <span className="empty-state-icon history-icon" aria-hidden="true">
+                  <Icon name="historyEmpty" size={20} />
+                </span>
+                <h3>Your progress starts here</h3>
+                <p>Tasks you complete will appear in this list.</p>
+              </div>
+            ) : (
+              <ul className="task-list history-list">
+                {taskHistory.map((task) => (
+                  <li key={task.id}>
+                    <article className="task-card history-card">
+                      <div className="task-card-main">
+                        <h3>{task.title}</h3>
+                        <PriorityBadge priority={task.priority} />
+                      </div>
+                      <p className="task-time">
+                        Completed:{' '}
+                        <time dateTime={task.completedAt}>
+                          {new Date(task.completedAt).toLocaleString()}
+                        </time>
+                      </p>
+                    </article>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </main>
+      )}
     </div>
   );
 }

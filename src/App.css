@@ -53,6 +53,24 @@
   font-size: 14px;
 }
 
+.button-logout {
+  min-height: 32px;
+  margin-top: 8px;
+  border-color: #d8deea;
+  background: #fff;
+  color: #344054;
+}
+
+.button-logout:hover:not(:disabled) {
+  border-color: #aebbd5;
+  background: #f8f9fc;
+}
+
+.button-logout:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
 .dashboard-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.65fr) minmax(280px, 1fr);
